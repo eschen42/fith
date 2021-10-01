@@ -1,0 +1,3 @@
+[submodule "aceincl"]
+	path = aceincl
+	url = git@github.com:eschen42/aceincl.git
