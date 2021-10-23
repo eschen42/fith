@@ -1,0 +1,130 @@
+# fith.icn - FITH is an implementation of FORTH-inspired language in Icon
+# objectives:
+#   * support for Icon-like words used in FORTH-like ways
+#   * primaries implemented in Icon
+#   * secondaries implemented as lists of primaries
+#   * secondaries organized into vocabularies
+#   * return stack implemented as a dummy; supports return-stack oriented words
+#       without altering possible flow of control, i.e.,
+#       >R without R> will not crash the program
+
+record _5th_header( word      # string identifying word
+                  , handler   # function used to process the sequence;
+                              #   either procedure for a primary
+                              #   or _5th_inner for a secondary
+                  , sequence  # sequence of words defining a new secondary
+                  , prev      # references previous word in dictionary
+                  , prev_homo # references previous word with same spelling
+                  )
+record _5th_vocabulary( word  # string identifying vocabulary
+                      , prev  # references previous word in dictionary
+                      )
+
+global globals # T(s->x): accessible by all interpreters
+global ctx     # _5th: execution context of the active interpreter
+
+record _5th_dict( # singleton dictionary of vocabulary
+  dictionary # T(s->x) table mapping vocabulary names to vocabularies
+)
+
+record _5th(
+  stack      # data stack
+, rstack     # pseudo-return stack, to support R>, >R, etc.
+, status     # result of last word, or null if last word produced no result
+, variables  # T(s->x) table of variables accessible within task
+, locals     # L[T(s->x)] list of tables mapping local name to value
+)
+
+procedure _5th_new_vocabulary( nme )
+  _5th_dictionary[ nme ] := [ ]
+end
+
+procedure _5th_inner( header )
+  local instruction
+  write( "_5th_inner interpreting word '", header.word, "'" )
+  push(ctx.locals, table())
+  every instruction := ! header.sequence
+    do ctx.status := instruction.handler( instruction ) | &null
+  pop(ctx.locals)
+  return
+end
+
+procedure _5th_init( )
+  local dict
+  if /globals
+    then {
+      globals := table()
+      globals["dictionary"] := dict := _5th_dict( table() )
+      # CONTEXT - vocabulary in which searches for words are performed
+      dict["CONTEXT"] := "FORTH"
+      # CURRENT - vocabulary to which new words will be added
+      dict["CURRENT"] := "FORTH"
+    }
+  return _5th( [ ], [ ], &null, table(), [ ] )
+end
+
+procedure _5th_dot( i ) # . - pop top of stack and print it, appending a space
+  i := pop( ctx.stack ) |
+    ( write("\n<< . (print routine) - STACK EMPTY >>"), fail )
+  writes( if type( i ) == "string" then i else image( i ) )
+  writes( " " )
+  return
+end
+
+procedure _5th_cr( ) # CR - print line break
+  write( "" )
+  return
+end
+
+procedure _5th_at( var ) # @ - push contents of a variable to stack
+  var := pop( ctx.stack ) |
+    ( write("\n<< @ - STACK EMPTY >>"), fail )
+  type( var ) == "string" |
+    ( write("\n<< @ - TOS NOT A VARIABLE >>"), fail )
+  return push( ctx.stack
+             , \ctx.locals[1][ var ] |
+               \ctx.variables[ var ] |
+               \globals      [ var ] |
+               fail
+             )
+end
+
+procedure _5th_store( var, val ) # ! - pop stack and store contents to a variable
+  ( var := pop( ctx.stack ), val := pop( ctx.stack ) ) |
+    ( write("\n<< ! - STACK EMPTY >>"), fail )
+  type( var ) == "string" |
+    ( write("\n<< ! - TOS NOT A VARIABLE >>"), fail )
+  return case var of {
+      key(ctx.locals[1]) : ctx.locals[1][ var ]
+      key(ctx.variables) : ctx.variables[ var ]
+      key(globals      ) : globals      [ var ]
+      default            : ctx.locals[1][ var ] | (&dump := 1, stop("_5th_store primary failed"))
+      #default             : (&dump := 1, stop("_5th_store primary failed"))
+    } := val
+end
+
+# interpreter assumes that ctx has a reference to its context
+procedure interp( header, context )
+  if /context then fail
+  header.handler( header )
+end
+
+procedure main( )
+  local header, header_store, header_at, header_dot, header_cr, lvl1, lvl2
+  ctx := _5th_init( )
+  header_store := _5th_header( ":=", _5th_store, , ,   )
+  header_at    := _5th_header( "=:", _5th_at, , ,   )
+  header_dot   := _5th_header(  ".", _5th_dot, , ,  )
+  header_cr    := _5th_header( "cr", _5th_cr, , ,  )
+  # : lvl2      := =:  . cr ;
+  # : lvl1 lvl2             . . cr ;
+  lvl2 := _5th_header("level2", _5th_inner, [ header_store, header_at, header_dot, header_cr ], ,  )
+  lvl1 := _5th_header("level1", _5th_inner, [ lvl2, header_dot, header_dot, header_cr ], ,  )
+  push( ctx.stack, 5 )
+  push( ctx.stack, "hello world" )
+  push( ctx.stack, "ONE" )
+  push( ctx.stack, 1 )
+  push( ctx.stack, "ONE" )
+  #&trace := -1
+  interp( lvl1, ctx )
+end
