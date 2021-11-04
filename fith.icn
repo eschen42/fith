@@ -79,17 +79,38 @@ record _5th_ctx( #: a FITH execution context (analogous to a co-expression)
 , variables  # T(s->x) table of variables accessible within task
 , self_ref   # self-reference, _5th_ctx, to clean globals when task ends
 , self_name  # used when _5th_init was called, s, used to clean globals
-, ip         # T(i->i) look-up index of next word in secondary at level
+, ip_lookup  # T(i->i) look-up index of next word in secondary at level
 , level      # incremented each time one secondary calls another
 )
 
-# Default inner interpreter when secondary does NOT invoke another
+# Inner interpreter when secondary EITHER invoke another secondary
+#   OR relies upon relative jumps (conditional or iteration blocks)
+procedure _5th_inner_composite(word) #: Instance of secondary _5th_word
+  local ctx_ip, ctx_level, instruction, ip, ctx_ip_lookup
+  $ifdef DEBUG
+  write( "_5th_inner_composite interpreting word '", word.nme, "'" )
+  $endif
+  ctx_ip_lookup := (\ctx.ip_lookup | ctx.ip_lookup := table())
+  ctx_level := (\ctx.level +:= 1) | (ctx.level := 1)
+  /ctx_ip_lookup[ctx_level] := 1
+  while ip := ctx_ip_lookup[ctx_level]
+    do {
+      #write("ctx_level ",ctx_level,", ip ",ip)
+      instruction := word.body[ip]
+      ctx.status := instruction.handler( instruction ) | &null
+      ctx_ip_lookup[ctx_level] +:= 1
+      if ctx_ip_lookup[ctx_level] > *word.body
+        then return write("ctx.level is now ", ctx.level -:= 1)
+    }
+end
+
+# Default inner interpreter when secondary NEITHER invoke another secondary
+#   NOR relies upon relative jumps (conditional or iteration blocks)
 procedure _5th_inner_atomic(word) #: Instance of secondary _5th_word
   local instruction
   $ifdef DEBUG
   write( "_5th_inner_atomic interpreting word '", word.nme, "'" )
   $endif
-  # TODO measure whether _GUARD _GUARD is more costly than table() push() pop()
   every instruction := ! word.body
     do ctx.status := instruction.handler( instruction ) | &null
   return
@@ -274,7 +295,7 @@ procedure _5th_store( var, val ) # ! - pop stack and store contents to a variabl
   return case var of {
       key(ctx.variables) : ctx.variables[ var ]
       key(globals      ) : globals      [ var ]
-      default            : ( write("\n<< ! - TOS '",var,"' DOES NOT NAME A VARIABLE >>"), fail )
+      default            : ctx.variables[ var ]
     } := val
 end
 
@@ -361,11 +382,12 @@ procedure _5th_core_defs()
 end
 
 procedure main()
+  #_5th_inner_atomic := _5th_inner_composite
   smoke1()
 end
 
 procedure smoke1( )
-  local word, header_store, header_at, header_dot, header_cr, lvl1, lvl2
+  local word, header_store, header_at, header_dot, header_cr, lvl1, lvl2, lvl3, lvl4
   local tok
   header_store := _5th_word( ":=", _5th_store, , ,   )
   header_at    := _5th_word( "=:", _5th_at, , ,   )
@@ -373,8 +395,10 @@ procedure smoke1( )
   header_cr    := _5th_word( "cr", _5th_cr, , ,  )
   # : lvl2      := =:  . cr ;
   # : lvl1 lvl2             . . cr ;
-  lvl2 := _5th_word("level2", _5th_inner_atomic, [ header_store, header_at, header_dot, header_cr ], ,  )
-  lvl1 := _5th_word("level1", _5th_inner_atomic, [ lvl2, header_dot, header_dot, header_cr ], ,  )
+  lvl4 := _5th_word("level4", _5th_inner_atomic, [ header_at ], ,  )
+  lvl3 := _5th_word("level3", _5th_inner_composite, [ header_store, lvl4 ], ,  )
+  lvl2 := _5th_word("level2", _5th_inner_composite, [ lvl3, header_dot, header_cr ], ,  )
+  lvl1 := _5th_word("level1", _5th_inner_composite, [ lvl2, header_dot, header_dot, header_cr ], ,  )
   ctx := _5th_init( "main", lvl1 )
   push( ctx.stack, 5 )
   push( ctx.stack, "hello world" )
@@ -383,7 +407,9 @@ procedure smoke1( )
   push( ctx.stack, "ONE" )
   interp( ctx )
   compile_mode := immediate_state := &null
-  every tok := token{ "\"level2\" : := =: . cr ; # level 2" |
+  every tok := token{ "\"level4\" : =:            ; # level 4" |
+                      "\"level3\" : := level4     ; # level 3" |
+                      "\"level2\" : level3 . cr   ; # level 2" |
                       "\"level1\" : level2 . . cr ; # level 1"
                     }
     do {
