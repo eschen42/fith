@@ -1,0 +1,420 @@
+############################################################################
+#
+#	File:     fith.icn
+#
+#	Subject:  FITH - An Forth-inspired, Icon-oriented, threaded language
+#
+#	Authors:  Art Eschenlauer
+#
+#	Date:     October 25, 2021
+#
+############################################################################
+#
+#   This file is in the public domain.
+#
+############################################################################
+#
+#   Inspired by:
+#     Loeliger, R. G. Threaded interpretive languages : their design and
+#     implementation / R.G. Loeliger. Peterborough, NH : BYTE Books, c1981.
+#       xiv, 251 p. : ill. ; 24 cm.
+#       QA76.7 .L63
+#       ISBN: 007038360X :
+#       https://lccn.loc.gov/80019392
+#
+#   This may still be available at:
+#     https://archive.org/details/R.G.LoeligerThreadedInterpretiveLanguagesTheirDesignAndImplementationByteBooks1981
+#
+############################################################################
+#
+# FITH is an implementation of FORTH-inspired language in Icon
+#
+# Objectives:
+#   - Support for Icon-like words used in FORTH-like ways
+#   - Primaries implemented in Icon
+#   - Secondaries implemented as lists of primaries
+#   - Secondaries organized into vocabularies
+#   - Return stack implemented as a dummy; supports return-stack oriented
+#       words without altering possible flow of control, i.e.,
+#       >R without R> will not crash the program.
+#
+############################################################################
+
+$define DEBUG
+$define _ROOT_VOCABULARY_NAME     "CORE"
+$define _USER_VOCABULARY_NAME     "FITH"
+# "Samuel Johnson compiled one of the most influential dictionaries of
+#    the English language." -- https://en.wiktionary.org/wiki/compile
+$define _COMPILER_VOCABULARY_NAME "COMPILER"
+$define _CONTEXT                  globals["context"]
+$define _CURRENT                  globals["current"]
+$define _DICTIONARY               globals["dictionary"]
+$define _ROOT_VOCABULARY          _DICTIONARY[_ROOT_VOCABULARY_NAME]
+$define _USER_VOCABULARY          _DICTIONARY[_USER_VOCABULARY_NAME]
+$define _COMPILER_VOCABULARY      _DICTIONARY[_COMPILER_VOCABULARY_NAME]
+$define _CONTEXT_VOCABULARY       _DICTIONARY[globals["context"]]
+$define _CURRENT_VOCABULARY       _DICTIONARY[globals["current"]]
+
+link escapesq # for escapeseq( ), escchar( )
+link ximage   # for ximage( )
+
+global globals # T(s->x): accessible by all interpreters
+global ctx     # _5th_ctx: execution context of the active interpreter
+
+# Loeliger p. 47 puts immediate words in the "compiler vocabulary" and sets
+#   the STATE flag (corresponding to immediate_state here); that vocabulary
+#   is searched first when the MODE flag (corresponding to compile_mode)
+#   is set, indicating that the word should be executed rather than
+#   incorporating it into the word being defined.  In other words, a word
+#   is executed unless MODE ~= STATE.  Tentatively, this approach will
+#   be taken here until efficiency dictates taking another.
+global compile_mode # not &null when compiling a colon definition; MODE in L.
+global immediate_state # not &null when word search produced immediate.
+
+record _5th_ctx( #: a FITH execution context (analogous to a co-expression)
+  stack      # data stack
+, rstack     # pseudo-return stack, to support R>, >R, etc.
+, status     # result of last word, or null if last word produced no result
+, entrypoint # entrypoint, _5th_word for interp to run via _5th_inner_atomic
+, variables  # T(s->x) table of variables accessible within task
+, self_ref   # self-reference, _5th_ctx, to clean globals when task ends
+, self_name  # used when _5th_init was called, s, used to clean globals
+, ip_lookup  # T(i->i) look-up index of next word in secondary at level
+, level      # incremented each time one secondary calls another
+)
+
+# Inner interpreter when secondary EITHER invoke another secondary
+#   OR relies upon relative jumps (conditional or iteration blocks)
+procedure _5th_inner_composite(word) #: Instance of secondary _5th_word
+  local ctx_ip, ctx_level, instruction, ip, ctx_ip_lookup
+  $ifdef DEBUG
+  write( "_5th_inner_composite interpreting word '", word.nme, "'" )
+  $endif
+  ctx_ip_lookup := (\ctx.ip_lookup | ctx.ip_lookup := table())
+  ctx_level := (\ctx.level +:= 1) | (ctx.level := 1)
+  /ctx_ip_lookup[ctx_level] := 1
+  while ip := ctx_ip_lookup[ctx_level]
+    do {
+      #write("ctx_level ",ctx_level,", ip ",ip)
+      instruction := word.body[ip]
+      ctx.status := instruction.handler( instruction ) | &null
+      ctx_ip_lookup[ctx_level] +:= 1
+      if ctx_ip_lookup[ctx_level] > *word.body
+        then return write("ctx.level is now ", ctx.level -:= 1)
+    }
+end
+
+# Default inner interpreter when secondary NEITHER invoke another secondary
+#   NOR relies upon relative jumps (conditional or iteration blocks)
+procedure _5th_inner_atomic(word) #: Instance of secondary _5th_word
+  local instruction
+  $ifdef DEBUG
+  write( "_5th_inner_atomic interpreting word '", word.nme, "'" )
+  $endif
+  every instruction := ! word.body
+    do ctx.status := instruction.handler( instruction ) | &null
+  return
+end
+
+# There is one global dictionary shared by all vocabularies and tasks.
+record _5th_dict( # singleton dictionary
+  dictionary # T(s->x) table mapping vocabulary names to vocabularies
+)
+
+# Initialize context for a new call to interp.
+#   The first time, also initialize global variables and dictionary;
+#   note that only the main task may define and search for words because
+#   _CONTEXT and _CURRENT are both global.
+procedure _5th_init( nme, word ) #: init interpreter named nme
+  local dict, context
+  if /globals
+    then {
+      globals := table()
+      _DICTIONARY := dict := _5th_dict( table() )
+      # _CONTEXT - name of vocabulary in which searches for words are performed
+      _CONTEXT := _ROOT_VOCABULARY_NAME
+      # _CURRENT - name of vocabulary to which new words will be added
+      _CURRENT := _ROOT_VOCABULARY_NAME
+      # Instantiate the root vocabulary.
+      #                                   nme,  prev, hmnym,
+      _ROOT_VOCABULARY :=
+        _5th_vocabulary(_ROOT_VOCABULARY_NAME, &null, table(), list())
+      # Instantiate the compiler vocabulary. Loeliger p. 26 suggests
+      #   avoiding linking this vocabulary to or from any others so
+      #   that compile-time words cannot be accidentally invoked at run-time.
+      _COMPILER_VOCABULARY :=
+        _5th_vocabulary(_COMPILER_VOCABULARY_NAME,
+                                               &null, table(), list())
+    }
+  # In the interest of speed, don't check type of word;
+  #   bad type will eventually cause runtime error.
+  return (
+    context :=
+      #         stack  rstack status entrypoint variables
+      _5th_ctx( list(),list(),&null ,word      ,table()
+      #         self_ref, self_name
+              , &null   , nme
+              )
+  , globals[nme] := context.self_ref := context
+  , context
+  )
+end
+
+# TODO accommodate a "catalog" of vocabulary names, S of s
+
+# A vocabulary may be either the _ROOT_VOCABULARY_NAME or
+#   an extension of another vocabulary
+record _5th_vocabulary(
+  nme   # string identifying vocabulary
+, prev  # references previous vocabulary in dictionary
+, hmnym # T(s->_5th_word) definition of latest homonym in vocabulary
+, top   # latest _5th_word in vocabulary
+)
+procedure _5th_new_vocabulary( nme )
+  local current, prev
+  current := _CURRENT
+  prev := _DICTIONARY[current]
+  _DICTIONARY[ nme ] :=
+    _5th_vocabulary(nme, prev, table(), list())
+end
+
+record _5th_word(
+  nme       # string identifying word
+, handler   # function used to process the body;
+            #   either procedure for a primary
+            #   or _5th_inner_atomic for a secondary
+, body      # list of words defining a new secondary
+, prev      # references previous word in vocabulary
+, hmnym     # references previous word with same spelling
+, vocab     # vocabulary where word is defined
+)
+
+# SEARCH - search current vocabulary and below for named word
+procedure _5th_search(
+    nme     # name of word, s
+  )
+  local top_word, vocab, vocab_hmnym, word
+  vocab := _CURRENT_VOCABULARY
+  # start with current vocabulary
+  vocab_hmnym := vocab.hmnym
+  repeat {
+    # return _5th_word when found in this vocabulary
+    return \vocab_hmnym[nme]
+    # next, search the vocabulary below, or abort (and fail)
+    #   when there are no more vocabularies below
+    if not vocab := \vocab.prev
+      then break
+  }
+end
+
+# FORGET - remove word from current vocabulary and any words defined since
+procedure _5th_forget(
+    nme     # name of word, s
+  )
+  local top_word, vocab, vocab_hmnym, word
+  vocab := _CURRENT_VOCABULARY
+  vocab_hmnym := vocab.hmnym
+  # search current vocabulary for word
+  if word := \vocab_hmnym[nme]
+    then {
+      # get the top word in the vocabulary
+      top_word := vocab.top
+      # keep deleting words until the word to be forgotten
+      while top_word ~=== word
+        do {
+          delete(vocab_hmnym, top_word.nme)
+        }
+      # now delete the word to be forgotten
+      vocab.top := word.prev
+      delete(vocab_hmnym, nme)
+    }
+end
+
+# CREATE - create a word in the current vocabulary
+procedure _5th_create(
+    nme     # name of word, s
+  , handler # handler for word, procedure (_5th_inner_atomic for secondary, or procedure for primary)
+  , body    # secondary body, L for secondary | &null for primary
+  )
+  # Reminder: a vocabulary may be either the _ROOT_VOCABULARY_NAME or
+  #   an extension of another vocabulary
+  local word      # _5th_word being defined
+  local current   # current vocabulary to which word is being added
+  local prev      # references previous word in current vocabulary
+  local hmnym     # references previous word with same spelling,
+                  #   in current vocabulary and parent vocabularies
+  current := _CURRENT_VOCABULARY
+  # set to not-null if same spelling of word exists in vocabulary
+  hmnym := current.hmnym[nme]
+  # get top word in vocabulary; after definition it will be 2nd to top
+  prev := current.top
+  # construct the word then put it into the dictionary and make it the
+  #   top word in the vocabulary; this is a record so it won't be &null
+  current.hmnym[nme] := current.top := _5th_word(
+    nme       # string identifying word
+  , handler   # function used to process the body;
+              #   either procedure for a primary
+              #   or _5th_inner_atomic for a secondary
+  , body      # list of words defining a new secondary
+  , prev      # references previous word in vocabulary
+  , hmnym     # references previous word with same spelling
+  , current   # vocabulary where word is defined
+  )
+end
+
+procedure _5th_dot( i ) # . - pop top of stack and print it, appending a space
+  i := pop( ctx.stack ) |
+    ( write("\n<< . (print routine) - STACK EMPTY >>"), fail )
+  writes( if type( i ) == "string" then i else image( i ) )
+  writes( " " )
+  return
+end
+
+procedure _5th_cr( ) # CR - print line break
+  write( "" )
+  return
+end
+
+procedure _5th_at( var ) # @ - push contents of a variable to stack
+  var := pop( ctx.stack ) |
+    ( write("\n<< @ - STACK EMPTY >>"), fail )
+  type( var ) == "string" |
+    ( write("\n<< @ - TOS NOT A VARIABLE >>"), fail )
+  return push( ctx.stack
+             , \ctx.variables[ var ] |
+               \globals      [ var ] |
+               fail
+             )
+end
+
+procedure _5th_store( var, val ) # ! - pop stack and store contents to a variable
+  ( var := pop( ctx.stack ), val := pop( ctx.stack ) ) |
+    ( write("\n<< ! - STACK EMPTY >>"), fail )
+  type( var ) == "string" |
+    ( write("\n<< ! - TOS NOT A VARIABLE NAME >>"), fail )
+  return case var of {
+      key(ctx.variables) : ctx.variables[ var ]
+      key(globals      ) : globals      [ var ]
+      default            : ctx.variables[ var ]
+    } := val
+end
+
+# interpreter assumes that ctx has a reference to its context
+procedure interp( context )
+  # In the interest of speed, don't check types;
+  #   bad types will cause runtime error.
+  local word
+  word := context.entrypoint
+  word.handler( word )
+  # since interpreter is exiting, retire its context
+  if globals[context.self_name] === context.self_ref
+    then delete(globals, context.self_name)
+end
+
+procedure token( CinL )
+  # suspend tokens from co-expression that produces one line per resumption
+  # tokens are separated by whitespace or enclosed by double quotes
+  # if enclosed in quotes, quotes are retained in the tokens produced
+  # if enclosed in quotes, Icon string escapes are respected
+  local line, i, tok, Cin
+  static ws, nws
+  initial nws := &cset -- (cset( ws := '\t\n\v\l\f\r\b\d' ) ++ ' ')
+  every Cin := ! CinL
+    do {
+      tok := &null
+      while line := @Cin
+        do line ? {
+          while not pos(0)
+            do {
+              # gobble whitespace if not quoted string
+              if /tok then tab(upto(nws)) | break
+              # extract the next token
+              if ( /tok, ="\"" ) # if not in quoted string & first char is dquote
+                then tok := "" # begin quoted string
+              else if /tok # if not in quoted string
+                then { # suspend through all non-whitespace characters, lcased
+                  if tok := ="#"
+                    then {
+                      tok ||:= tab(0)
+                      #if echo === write then suspend tok
+                    }
+                    else {
+                      tok := map( tab( many(nws) | 0 ) )
+                      suspend tok
+                    }
+                  tok := &null
+                }
+              # remaining cases assume in quoted string
+              else if tok ||:= tab(upto('\\"')) # handle escapes and close quotes
+                then {
+                  case move(1) | &null of {
+                    "\\" : { # process backslash escape
+                      move(-1)
+                      tok ||:= escchar( escapeseq( ) ) | 2( move(1), move(1)|"\n" )
+                    }
+                    "\"" : { # process closed quote
+                      suspend "\"" || tok || "\""
+                      tok := &null
+                      tab(many(ws))
+                    }
+                  }
+                }
+              else tok ||:= tab(0) # no close dquote on line
+            }
+          #suspend "&cr"
+        }
+    }
+end
+
+procedure _5th_core_defs()
+  # precondition: _DICTIONARY has been initialized by _5th_init
+  local vocab
+  # _CONTEXT - name of vocabulary in which searches for words are performed
+  # _CURRENT - name of vocabulary to which new words will be added
+  _CONTEXT := _CURRENT := _ROOT_VOCABULARY_NAME
+  # record _5th_vocabulary(
+  #   nme   # string identifying vocabulary
+  # , prev  # references previous vocabulary in dictionary
+  # , hmnym # T(s->_5th_word) definition of latest homonym in vocabulary
+  # , top   # latest _5th_word in vocabulary.
+  # )
+  vocab := _CURRENT_VOCABULARY
+end
+
+procedure main()
+  #_5th_inner_atomic := _5th_inner_composite
+  smoke1()
+end
+
+procedure smoke1( )
+  local word, header_store, header_at, header_dot, header_cr, lvl1, lvl2, lvl3, lvl4
+  local tok
+  header_store := _5th_word( ":=", _5th_store, , ,   )
+  header_at    := _5th_word( "=:", _5th_at, , ,   )
+  header_dot   := _5th_word(  ".", _5th_dot, , ,  )
+  header_cr    := _5th_word( "cr", _5th_cr, , ,  )
+  # : lvl2      := =:  . cr ;
+  # : lvl1 lvl2             . . cr ;
+  lvl4 := _5th_word("level4", _5th_inner_atomic, [ header_at ], ,  )
+  lvl3 := _5th_word("level3", _5th_inner_composite, [ header_store, lvl4 ], ,  )
+  lvl2 := _5th_word("level2", _5th_inner_composite, [ lvl3, header_dot, header_cr ], ,  )
+  lvl1 := _5th_word("level1", _5th_inner_composite, [ lvl2, header_dot, header_dot, header_cr ], ,  )
+  ctx := _5th_init( "main", lvl1 )
+  push( ctx.stack, 5 )
+  push( ctx.stack, "hello world" )
+  push( ctx.stack, "ONE" )
+  push( ctx.stack, 1 )
+  push( ctx.stack, "ONE" )
+  interp( ctx )
+  compile_mode := immediate_state := &null
+  every tok := token{ "\"level4\" : =:            ; # level 4" |
+                      "\"level3\" : := level4     ; # level 3" |
+                      "\"level2\" : level3 . cr   ; # level 2" |
+                      "\"level1\" : level2 . . cr ; # level 1"
+                    }
+    do {
+      writes("  ", tok)
+    }
+  write()
+end
+# vim: ai ts=2 sw=2 et :
