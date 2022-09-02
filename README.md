@@ -10,7 +10,7 @@ When an Icon program starts, the \&main co-expression is activated and procedure
   procedure fith()
     return wora(fith, &main)
   end
-  
+
   # WORA - Writeable-by-One, Readable-by-All
   procedure wora(id)
     local owner
@@ -33,7 +33,7 @@ When an Icon program starts, the \&main co-expression is activated and procedure
       suspend .(s_valueT[id])
     }
   end
-  
+
   procedure main(args)
     wora(fith) := create "fith(): fith is " || image(fith())
     write("&main: wora(fith) = ", image(wora(fith)))
